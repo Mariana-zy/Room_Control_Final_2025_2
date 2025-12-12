@@ -21,8 +21,6 @@ endif()
 # Set the project name
 set(CMAKE_PROJECT_NAME Room_Control_Final_2025_1)
 
-# Include toolchain file
-include("cmake/gcc-arm-none-eabi.cmake")
 
 # Enable compile command to ease indexing with e.g. clangd
 set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
@@ -53,6 +51,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Drivers/ssd1306/ssd1306_fonts.c
     Drivers/keypad/keypad.c
     Core/Src/room_control.c
+    Core/Src/temperature_sensor.c
+    Core/Src/command_parser.c
+
     # Add user sources here
 )
 

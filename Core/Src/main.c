@@ -29,6 +29,8 @@
 
 #include "ssd1306.h"
 #include "ssd1306_fonts.h"
+#include "temperature_sensor.h"
+#include "command_parser.h"
 
 /* USER CODE END Includes */
 
@@ -48,12 +50,15 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
 I2C_HandleTypeDef hi2c1;
 
 TIM_HandleTypeDef htim3;
 DMA_HandleTypeDef hdma_tim3_ch1_trig;
 
 UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
 uint8_t button_pressed = 0; // Flag to indicate if the button is pressed
@@ -77,6 +82,7 @@ uint8_t keypad_buffer[KEYPAD_BUFFER_LEN];
 ring_buffer_t keypad_rb;
 
 volatile uint16_t keypad_interrupt_pin = 0;
+volatile uint16_t keypad_interrupt_time = 0; // Tiempo de la interrupción
 
 // Room control system instance
 room_control_t room_system;
@@ -89,6 +95,8 @@ static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -118,14 +126,20 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     button_pressed = 1; // Set the flag when the button is pressed
   } else {
     keypad_interrupt_pin = GPIO_Pin;
+    keypad_interrupt_time = HAL_GetTick(); // Guardar el tiempo de la interrupción
   }
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART2) {
+    // Enviar el byte al parser de debug
+    command_parser_process_debug(usart_2_rxbyte);
+
+    // Re-armar recepción
     HAL_UART_Receive_IT(&huart2, &usart_2_rxbyte, 1);
   }
+  // USART3 lo usaremos en nivel intermedio
 }
 
 void heartbeat(void)
@@ -172,6 +186,8 @@ int main(void)
   MX_USART2_UART_Init();
   MX_I2C1_Init();
   MX_TIM3_Init();
+  MX_ADC1_Init();
+  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
   led_init(&heartbeat_led);
   ssd1306_Init();
@@ -180,8 +196,10 @@ int main(void)
   ring_buffer_init(&keypad_rb, keypad_buffer, KEYPAD_BUFFER_LEN);
   keypad_init(&keypad);
   
+  temperature_sensor_init();  // Inicializar módulo de temperatura (LM35)
+
   // TODO: TAREA - Descomentar cuando implementen la lógica del sistema
-  // room_control_init(&room_system);
+  room_control_init(&room_system);
 
   /* USER CODE END 2 */
 
@@ -189,24 +207,47 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   // Clear the display
   ssd1306_Fill(Black);
-  write_to_oled("Hello, 4100901!", White, 17, 17);
-  printf("Hello, 4100901!\r\n");
+  // write_to_oled("Hello, 4100901!", White, 17, 17);
+  // printf("Hello, 4100901!\r\n");
+  printf("Sistema iniciado\r\n");
   while (1) {
     heartbeat(); // Call the heartbeat function to toggle the LED
 
     // TODO: TAREA - Descomentar cuando implementen la máquina de estados
-    // room_control_update(&room_system);
+    room_control_update(&room_system);
 
     // DEMO: Keypad functionality - Remove when implementing room control logic
+    static uint32_t last_key_time = 0;      // Guardar el tiempo de la última tecla
+    static char last_key_value = '\0';      // Guardar el valor de la última tecla
+
     if (keypad_interrupt_pin != 0) {
-      char key = keypad_scan(&keypad, keypad_interrupt_pin);
-      if (key != '\0') {
-        write_to_oled(&key, White, 31, 31);
-        
-        // TODO: TAREA - Descomentar para enviar teclas al sistema de control
-        // room_control_process_key(&room_system, key);
+      uint32_t now = HAL_GetTick();
+
+      // Esperar un pequeño tiempo de estabilización del contacto (debounce)
+      if (now - keypad_interrupt_time >= 20) {   // ~20 ms de debounce
+
+        char key = keypad_scan(&keypad, keypad_interrupt_pin);
+        if (key != '\0') {
+
+          // Filtro extra: si es la misma tecla rebotando muy seguido, la ignoramos
+          if ((now - last_key_time > 150) || (key != last_key_value)) {
+
+            write_to_oled(&key, White, 31, 31);
+
+            // Debug: mostrar tecla y estado actual
+            printf("[KEYPAD] Tecla: %c, estado actual: %d\r\n",
+              key, room_control_get_state(&room_system));
+
+            // TODO: TAREA - Descomentar para enviar teclas al sistema de control
+            room_control_process_key(&room_system, key);
+
+            last_key_time = now;
+            last_key_value = key;
+          }
+        }
+
+        keypad_interrupt_pin = 0;
       }
-      keypad_interrupt_pin = 0;
     }
 
     // DEMO: Button functionality - Remove when implementing room control logic  
@@ -225,8 +266,9 @@ int main(void)
     // command_parser_process(); // Procesar comandos de UART2 y UART3
     
     // TODO: TAREA - Leer sensor de temperatura y actualizar sistema
-    // float temperature = temperature_sensor_read();
-    // room_control_set_temperature(&room_system, temperature);
+    float temperature = temperature_sensor_read();
+    room_control_set_temperature(&room_system, temperature);
+    
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -281,6 +323,73 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_MultiModeTypeDef multimode = {0};
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.LowPowerAutoWait = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.OversamplingMode = DISABLE;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure the ADC multi-mode
+  */
+  multimode.Mode = ADC_MODE_INDEPENDENT;
+  if (HAL_ADCEx_MultiModeConfigChannel(&hadc1, &multimode) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_5;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+  sConfig.SingleDiff = ADC_SINGLE_ENDED;
+  sConfig.OffsetNumber = ADC_OFFSET_NONE;
+  sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
@@ -416,6 +525,41 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
@@ -449,7 +593,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, DOOR_STATUS_Pin|LD2_Pin|KEYPAD_R1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4|LD2_Pin|KEYPAD_R1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, KEYPAD_R2_Pin|KEYPAD_R4_Pin|KEYPAD_R3_Pin, GPIO_PIN_RESET);
@@ -460,8 +604,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : DOOR_STATUS_Pin LD2_Pin KEYPAD_R1_Pin */
-  GPIO_InitStruct.Pin = DOOR_STATUS_Pin|LD2_Pin|KEYPAD_R1_Pin;
+  /*Configure GPIO pins : PA4 LD2_Pin KEYPAD_R1_Pin */
+  GPIO_InitStruct.Pin = GPIO_PIN_4|LD2_Pin|KEYPAD_R1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
